@@ -7,6 +7,7 @@ import os
 import sys
 from email.header import decode_header
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import requests
@@ -26,6 +27,34 @@ def load_config() -> dict:
         return {}
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_accounts_from_excel(path: str) -> list:
+    """Load accounts from Excel file.
+    Columns: A=number, B=email, C=refresh_token, D=(skip), E=client_id.
+    First row is treated as header and skipped.
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True)
+    ws = wb.active
+    accounts = []
+    for row in ws.iter_rows(min_row=2, values_only=True):  # skip header
+        if not row or len(row) < 5:
+            continue
+        num = row[0]
+        email_addr = row[1]
+        refresh_token = row[2]
+        client_id = row[4]
+        if not email_addr or not refresh_token or not client_id:
+            continue
+        accounts.append({
+            "num": str(num).strip(),
+            "email": str(email_addr).strip(),
+            "refresh_token": str(refresh_token).strip(),
+            "client_id": str(client_id).strip(),
+        })
+    wb.close()
+    return accounts
 
 
 def get_access_token(client_id: str, refresh_token: str) -> dict:
@@ -186,13 +215,22 @@ def format_message(i: int, total: int, msg: email.message.Message) -> str:
     return "\n".join(lines)
 
 
+def parse_msg_date(msg: email.message.Message) -> datetime:
+    """Parse message Date header into datetime. Returns epoch on failure."""
+    try:
+        return parsedate_to_datetime(msg["Date"])
+    except Exception:
+        return datetime(1970, 1, 1)
+
+
 def fetch_all_messages(
     client_id: str,
     refresh_token: str,
     user_email: Optional[str] = None,
 ) -> tuple:
     """Fetch all messages from Outlook inbox via IMAP with OAuth2.
-    Returns (user_email, list_of_formatted_messages, total_count).
+    Returns (user_email, list_of_parsed_messages, total_count).
+    Messages are sorted newest-first.
     """
     # 1. Get access token
     print("Getting access token...")
@@ -246,7 +284,7 @@ def fetch_all_messages(
     print(f"Total messages in INBOX: {len(msg_ids)}")
 
     # 4. Fetch each message
-    all_formatted = []
+    messages = []
     for i, msg_id in enumerate(msg_ids, 1):
         status, msg_data = imap.fetch(msg_id, "(RFC822)")
         if status != "OK":
@@ -255,31 +293,44 @@ def fetch_all_messages(
 
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
+        messages.append(msg)
 
         subject = decode_mime_header(msg["Subject"])
         from_addr = decode_mime_header(msg["From"])
         date_str = msg["Date"] or ""
-
-        formatted = format_message(i, len(msg_ids), msg)
-        all_formatted.append(formatted)
-
         print(f"  [{i}/{len(msg_ids)}] {date_str[:16]}  {from_addr[:30]}  {subject[:40]}")
 
     # 5. Logout
     imap.logout()
 
-    return user_email, all_formatted, len(msg_ids)
+    # 6. Sort newest first
+    messages.sort(key=parse_msg_date, reverse=True)
+
+    return user_email, messages, len(msg_ids)
 
 
-def write_report(user_email: str, formatted: list, total: int, output_dir: str):
-    """Write formatted messages to {email}.txt."""
+def build_report(user_email: str, messages: list, total: int) -> str:
+    """Build formatted report text from sorted messages."""
+    lines = []
+    lines.append(f"Почтовый ящик: {user_email}")
+    lines.append(f"Дата выгрузки:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Всего писем:    {total}\n")
+    for i, msg in enumerate(messages, 1):
+        lines.append(format_message(i, total, msg))
+    return "\n".join(lines)
+
+
+def write_report(user_email: str, messages: list, total: int, output_dir: str, prefix: Optional[str] = None):
+    """Write formatted messages to {prefix}_{email}.txt or {email}.txt."""
     os.makedirs(output_dir, exist_ok=True)
-    report_path = os.path.join(output_dir, f"{user_email}.txt")
+    if prefix is not None:
+        filename = f"{prefix}_{user_email}.txt"
+    else:
+        filename = f"{user_email}.txt"
+    report_path = os.path.join(output_dir, filename)
+    report_text = build_report(user_email, messages, total)
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(f"Почтовый ящик: {user_email}\n")
-        f.write(f"Дата выгрузки:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Всего писем:    {total}\n\n")
-        f.write("\n".join(formatted))
+        f.write(report_text)
     print(f"Сохранено: {report_path}")
 
 
@@ -288,36 +339,42 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Fetch all Outlook emails via IMAP using OAuth2 refresh token. "
-        "Supports multiple accounts via config.json."
+        "Supports multiple accounts via config.json or Excel file."
     )
     parser.add_argument("--client-id", default=None, help="Azure app client_id (single account mode)")
     parser.add_argument("--refresh-token", default=None, help="OAuth2 refresh_token (single account mode)")
     parser.add_argument("--email", default=None, help="User email (auto-detected if not provided)")
     parser.add_argument("--output-dir", default=None, help="Directory to save .txt files (if not set, prints to console)")
+    parser.add_argument("--excel", default=None, help="Path to .xlsx file with accounts (columns: num, email, token, client_id)")
     args = parser.parse_args()
 
     output_dir = args.output_dir or config.get("output_dir")
 
     # Build list of accounts to process
     accounts = []
-    if args.client_id and args.refresh_token:
+    if args.excel:
+        accounts = load_accounts_from_excel(args.excel)
+    elif args.client_id and args.refresh_token:
         accounts.append({
+            "num": 1,
             "client_id": args.client_id,
             "refresh_token": args.refresh_token,
             "email": args.email,
         })
     elif config.get("accounts"):
-        accounts = config["accounts"]
+        for i, acc in enumerate(config["accounts"], 1):
+            acc.setdefault("num", i)
+            accounts.append(acc)
     elif config.get("client_id") and config.get("refresh_token"):
-        # Backward compat: old single-account config format
         accounts.append({
+            "num": 1,
             "client_id": config["client_id"],
             "refresh_token": config["refresh_token"],
             "email": config.get("email"),
         })
 
     if not accounts:
-        print("Error: no accounts configured. Add 'accounts' to config.json or pass --client-id/--refresh-token.", file=sys.stderr)
+        print("Error: no accounts found. Use --excel, config.json, or --client-id/--refresh-token.", file=sys.stderr)
         sys.exit(1)
 
     print(f"Accounts to process: {len(accounts)}\n")
@@ -326,6 +383,7 @@ def main():
         client_id = account.get("client_id")
         refresh_token = account.get("refresh_token")
         email_addr = account.get("email")
+        num = account.get("num", idx)
 
         if not client_id or not refresh_token:
             print(f"[Account {idx}] Skipping: missing client_id or refresh_token", file=sys.stderr)
@@ -336,7 +394,7 @@ def main():
         print(f"{'=' * 50}")
 
         try:
-            user_email, formatted, total = fetch_all_messages(client_id, refresh_token, email_addr)
+            user_email, messages, total = fetch_all_messages(client_id, refresh_token, email_addr)
         except Exception as e:
             print(f"[Account {idx}] Error: {e}", file=sys.stderr)
             continue
@@ -344,11 +402,13 @@ def main():
         if not user_email:
             continue
 
-        if output_dir and formatted:
-            write_report(user_email, formatted, total, output_dir)
-        elif formatted:
+        prefix = str(num)
+
+        if output_dir and messages:
+            write_report(user_email, messages, total, output_dir, prefix)
+        elif messages:
             print()
-            print("\n".join(formatted))
+            print(build_report(user_email, messages, total))
 
         print(f"Готово. Обработано писем: {total}.\n")
 
