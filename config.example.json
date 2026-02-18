@@ -1,0 +1,15 @@
+{
+    "output_dir": null,
+    "accounts": [
+        {
+            "client_id": "YOUR_CLIENT_ID",
+            "refresh_token": "YOUR_REFRESH_TOKEN",
+            "email": "user1@outlook.com"
+        },
+        {
+            "client_id": "YOUR_CLIENT_ID",
+            "refresh_token": "ANOTHER_REFRESH_TOKEN",
+            "email": "user2@outlook.com"
+        }
+    ]
+}
